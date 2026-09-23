@@ -6,14 +6,29 @@ extracts the Thermal IR channel, and normalizes them into
 3-channel RGB-like tensors compatible with standard PyTorch
 vision models (e.g., RIFE).
 
-HOW TO USE:
------------
+HOW TO USE WITH REAL DATA:
+---------------------------
 1. Place your real INSAT .nc files at:
        data/insat_t0.nc   (timestamp t=00 min)
        data/insat_t30.nc  (timestamp t=30 min)
-2. Update VARIABLE_NAME below to match your NetCDF variable key
-   (e.g., "TIR1", "BT", "brightness_temperature").
-3. Run:  python data_processor.py
+
+2. Run the inspector to see what's inside your file:
+       python inspect_nc.py data/insat_t0.nc
+
+3. Set VARIABLE_NAME below to the correct variable key.
+   Use "AUTO" to let the script detect it automatically.
+
+4. In app.py sidebar, toggle "Use Synthetic Data" OFF and
+   click the Run button.
+
+Common INSAT-3D variable names:
+   "TIR1"  — Thermal IR 1 (~10.8 um)   ← most common
+   "TIR2"  — Thermal IR 2 (~12.0 um)
+   "WV"    — Water Vapour  (~6.7 um)
+   "VIS"   — Visible       (~0.65 um)
+   "SWIR"  — Short-wave IR (~1.6 um)
+   "MIR"   — Mid IR        (~3.9 um)
+   Set to "AUTO" to auto-detect the best 2D variable.
 """
 
 import os
@@ -32,10 +47,15 @@ T0_FILE  = os.path.join(DATA_DIR, "insat_t0.nc")
 T30_FILE = os.path.join(DATA_DIR, "insat_t30.nc")
 
 # The NetCDF variable name for the Thermal IR channel.
-# Common INSAT-3D names: "TIR1", "TIR2", "WV", "BT", "IMG_TIR1"
-VARIABLE_NAME = "TIR1"
+# Set to "AUTO" to auto-detect the best 2D image variable.
+# Common INSAT-3D names: "TIR1", "TIR2", "WV", "VIS", "SWIR", "MIR"
+VARIABLE_NAME = "AUTO"
 
-# Target spatial resolution for the model (must be divisible by 32 for RIFE)
+# Preferred variable priority order for AUTO detection
+AUTO_PRIORITY = ["CMI", "TIR1", "TIR2", "WV", "MIR", "SWIR", "VIS",
+                  "IMG_TIR1", "IMG_TIR2", "BT", "brightness_temperature"]
+
+# Target spatial resolution (must be divisible by 32 for RIFE)
 TARGET_H = 512
 TARGET_W = 512
 
@@ -77,11 +97,54 @@ def _create_dummy_nc(filepath: str, seed: int = 0) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+#  AUTO-DETECTION HELPER
+# ─────────────────────────────────────────────────────────────
+def _auto_detect_variable(ds: "xr.Dataset", filepath: str) -> str:
+    """
+    Automatically finds the best 2D image variable in a NetCDF dataset.
+
+    Priority order: AUTO_PRIORITY list first, then any 2D variable
+    with both spatial dimensions > 50 pixels.
+    """
+    available = list(ds.data_vars)
+
+    # 1. Try the priority list first
+    for candidate in AUTO_PRIORITY:
+        if candidate in available:
+            arr = ds[candidate].values.squeeze()
+            if arr.ndim == 2 and arr.shape[0] > 50 and arr.shape[1] > 50:
+                print(f"  [AUTO] Detected variable: '{candidate}' "
+                      f"(shape after squeeze: {arr.shape})")
+                return candidate
+
+    # 2. Fall back: any variable that squeezes to 2D image
+    for vname in available:
+        arr = ds[vname].values.squeeze()
+        if arr.ndim == 2 and arr.shape[0] > 50 and arr.shape[1] > 50:
+            print(f"  [AUTO] Detected variable: '{vname}' "
+                  f"(shape after squeeze: {arr.shape})")
+            return vname
+
+    raise ValueError(
+        f"Could not auto-detect a 2D image variable in {filepath}.\n"
+        f"  Available variables: {available}\n"
+        f"  Run: python inspect_nc.py {filepath}\n"
+        f"  Then set VARIABLE_NAME explicitly in data_processor.py."
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 #  CORE LOADING & NORMALIZATION
 # ─────────────────────────────────────────────────────────────
 def load_nc_channel(filepath: str, variable: str) -> np.ndarray:
     """
-    Opens a NetCDF file and extracts a 2D array for `variable`.
+    Opens a NetCDF file and extracts a calibrated 2D float32 array.
+
+    Handles real INSAT-3D data quirks:
+      - Auto-detection when variable = "AUTO"
+      - _FillValue / missing_value masking  (set to NaN)
+      - scale_factor / add_offset calibration (L1B packing)
+      - Squeezes extra time / level / scan dimensions
 
     Returns:
         np.ndarray of shape (H, W), dtype float32
@@ -89,33 +152,72 @@ def load_nc_channel(filepath: str, variable: str) -> np.ndarray:
     if not os.path.exists(filepath):
         raise FileNotFoundError(
             f"NetCDF file not found: {filepath}\n"
-            f"  → Place your INSAT .nc file there, or set USE_DUMMY=True "
-            f"    in data_processor.py to auto-generate synthetic data."
+            f"  Place your INSAT .nc file there, or toggle 'Use Synthetic Data'"
+            f" ON in the Streamlit sidebar."
         )
 
-    ds = xr.open_dataset(filepath)
+    # mask_and_scale=False lets us handle fill/scale manually for robustness
+    ds = xr.open_dataset(filepath, mask_and_scale=False)
 
-    if variable not in ds.data_vars:
+    # Resolve variable name
+    resolved = variable
+    if variable == "AUTO":
+        resolved = _auto_detect_variable(ds, filepath)
+
+    if resolved not in ds.data_vars:
         available = list(ds.data_vars)
         raise KeyError(
-            f"Variable '{variable}' not found in {filepath}.\n"
-            f"  Available variables: {available}\n"
-            f"  → Update VARIABLE_NAME in data_processor.py."
+            f"Variable '{resolved}' not found in {filepath}.\n"
+            f"  Available: {available}\n"
+            f"  Run: python inspect_nc.py {filepath}\n"
+            f"  Then update VARIABLE_NAME in data_processor.py."
         )
 
-    data = ds[variable].values.astype(np.float32)  # raw shape: (..., H, W) or (H, W)
+    var_obj = ds[resolved]
+    data = var_obj.values.astype(np.float32)
 
-    # Squeeze any singleton time/level dimensions
+    # ── Fill value masking ──────────────────────────────────────
+    fill_val = var_obj.attrs.get("_FillValue",
+               var_obj.attrs.get("missing_value", None))
+    if fill_val is not None:
+        fill_val = float(fill_val)
+        # Replace fill values with NaN so they don't skew normalization
+        data[data == fill_val] = np.nan
+        # Also catch common sentinel values like -9999, 65535
+        data[data < -1000] = np.nan
+        data[data > 65000] = np.nan
+
+    # ── Scale / offset calibration (INSAT L1B packing) ─────────
+    scale  = float(var_obj.attrs.get("scale_factor",  1.0))
+    offset = float(var_obj.attrs.get("add_offset",    0.0))
+    if scale != 1.0 or offset != 0.0:
+        data = data * scale + offset
+        print(f"  [Calibration] Applied scale={scale}, offset={offset}")
+
+    # ── Squeeze extra dimensions (time, level, scan_line) ──────
     while data.ndim > 2:
-        data = data.squeeze(axis=0)
+        if data.shape[0] == 1:
+            data = data.squeeze(axis=0)
+        else:
+            # Take the first slice along leading dim
+            data = data[0]
+            print(f"  [Warning] Multiple slices in leading dim; using index 0")
 
     if data.ndim != 2:
         raise ValueError(
-            f"Expected 2D array after squeezing, got shape {data.shape}."
+            f"Expected 2D array after processing, got shape {data.shape}.\n"
+            f"  Run inspect_nc.py to diagnose the file structure."
         )
 
-    print(f"  Loaded '{variable}' from {filepath} — shape: {data.shape}, "
-          f"range: [{data.min():.1f}, {data.max():.1f}]")
+    valid_count = int(np.sum(~np.isnan(data)))
+    total_count = data.size
+    print(f"  Loaded '{resolved}' from {os.path.basename(filepath)} "
+          f"— shape: {data.shape}, "
+          f"valid pixels: {valid_count}/{total_count} "
+          f"({100*valid_count/total_count:.1f}%), "
+          f"range: [{np.nanmin(data):.1f}, {np.nanmax(data):.1f}]")
+
+    ds.close()
     return data
 
 
@@ -146,6 +248,11 @@ def normalize_to_tensor(
     span = v_high - v_low if (v_high - v_low) > 1e-6 else 1.0
     arr_norm = (arr - v_low) / span           # now in [0, 1]
     arr_norm = arr_norm.astype(np.float32)
+
+    # --- 2.5 Fill NaNs before OpenCV resize ---
+    # Space pixels (outside Earth disk) are NaN. OpenCV resize will propagate
+    # NaN across the image. Fill them with 0 (black space).
+    np.nan_to_num(arr_norm, copy=False, nan=0.0)
 
     # --- 3. Resize with OpenCV ---
     if arr_norm.shape != (target_h, target_w):

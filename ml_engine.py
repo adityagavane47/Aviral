@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────
-USE_RIFE    = False           # Set True once you have RIFE weights
+USE_RIFE    = True            # RIFE deep learning model ACTIVE
 MODELS_DIR  = "models"       # Where RIFE weights/folders live
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -58,39 +58,56 @@ print(f"[MLEngine] Device: {DEVICE}")
 # ═════════════════════════════════════════════════════════════
 class RIFEWrapper:
     """
-    Thin wrapper around the official RIFE HDv3 model.
+    Thin wrapper around the official RIFE HD model (hzwer/ECCV2022-RIFE).
 
     Requires:
-      - ECCV2022-RIFE source cloned and on sys.path
-      - model/RIFE_HDv3.py accessible
-      - weights at models/train_log/
+      - ECCV2022-RIFE source cloned to models/ECCV2022-RIFE/
+      - Pre-trained weights at models/train_log/flownet.pkl
+
+    Run download_rife_weights.py to get the weights automatically.
     """
 
     def __init__(self, model_dir: str = MODELS_DIR):
-        # Add the RIFE source directory to Python path so imports work
+        # Add the RIFE source directory to Python path so model.* imports work
         rife_src = os.path.join(model_dir, "ECCV2022-RIFE")
-        if os.path.isdir(rife_src):
-            sys.path.insert(0, rife_src)
+        if not os.path.isdir(rife_src):
+            raise FileNotFoundError(
+                f"RIFE source not found at {rife_src}\n"
+                f"  Run: git clone --depth=1 https://github.com/hzwer/ECCV2022-RIFE.git {rife_src}"
+            )
+        sys.path.insert(0, rife_src)
+
+        # The downloaded HD weights came with their own exact model files 
+        # (RIFE_HDv3.py and IFNet_HDv3.py) to avoid version mismatches.
+        # They expect to be imported via 'train_log.xxx'
+        sys.path.insert(0, model_dir)
+        train_log = os.path.join(model_dir, "train_log")
+
+        weight_file = os.path.join(train_log, "flownet.pkl")
+        if not os.path.isfile(weight_file):
+            raise FileNotFoundError(
+                f"RIFE weights not found: {weight_file}\n"
+                f"  Run: python download_rife_weights.py"
+            )
 
         try:
-            from model.RIFE_HDv3 import Model  # type: ignore
+            from train_log.RIFE_HDv3 import Model  # type: ignore
             self.model = Model()
-            train_log = os.path.join(model_dir, "train_log")
-            if not os.path.isdir(train_log):
-                raise FileNotFoundError(
-                    f"RIFE weights folder not found: {train_log}\n"
-                    f"  Download weights from the ECCV2022-RIFE GitHub releases."
-                )
-            self.model.load_model(train_log, -1)
             self.model.eval()
-            self.model.device()
-            print(f"[RIFE] Loaded weights from: {train_log}")
-        except ImportError as e:
-            raise ImportError(
-                f"Could not import RIFE model: {e}\n"
-                f"  Clone https://github.com/megvii-research/ECCV2022-RIFE "
-                f"into {rife_src}"
+
+            # Load weights manually to handle PyTorch 2.0 backward compatibility
+            raw = torch.load(
+                weight_file,
+                map_location="cpu",
+                weights_only=False,
             )
+            # Strip DDP module prefix if present
+            if any("module." in k for k in raw.keys()):
+                raw = {k.replace("module.", ""): v for k, v in raw.items() if "module." in k}
+            self.model.flownet.load_state_dict(raw)
+            print(f"[RIFE] Model loaded successfully from: {weight_file}")
+        except ImportError as e:
+            raise ImportError(f"Failed to import RIFE model: {e}")
 
     def interpolate(
         self, frame0: torch.Tensor, frame1: torch.Tensor, timestep: float = 0.5
@@ -105,7 +122,8 @@ class RIFEWrapper:
         with torch.no_grad():
             f0 = frame0.to(DEVICE)
             f1 = frame1.to(DEVICE)
-            mid = self.model.inference(f0, f1, timestep=timestep)
+            # RIFE_HDv3 only does 2x interpolation (always computes t=0.5)
+            mid = self.model.inference(f0, f1)
         return mid.clamp(0.0, 1.0).cpu()
 
 

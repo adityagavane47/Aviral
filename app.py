@@ -324,19 +324,23 @@ def load_interpolator():
 
 
 @st.cache_data(show_spinner=False)
-def run_pipeline(use_dummy: bool = True):
+def run_pipeline(use_dummy: bool = True, _variable_name: str = "AUTO"):
     """
     End-to-end pipeline: load data → interpolate → compute metrics.
     Cached so refreshing the page doesn't re-run everything.
+    _variable_name is a cache-bust key: when VARIABLE_NAME changes,
+    the cache is invalidated and data re-loaded fresh.
 
     Returns:
         dict with: frame_t0, frame_t30, frame_t15, frame_naive, metrics
     """
-    from data_processor import get_frame_tensors
+    import importlib
+    import data_processor as dp_module
+    importlib.reload(dp_module)          # force fresh module state
     from ml_engine import run_interpolation, get_interpolator
 
     # 1. Load satellite data
-    t0, t30, raw0, raw30 = get_frame_tensors(use_dummy=use_dummy)
+    t0, t30, raw0, raw30 = dp_module.get_frame_tensors(use_dummy=use_dummy)
 
     # 2. Interpolate t=15 min frame
     interp = get_interpolator()
@@ -445,7 +449,11 @@ if "pipeline_result" not in st.session_state or run_btn:
         time.sleep(0.2)
 
         try:
-            result = run_pipeline(use_dummy=use_dummy)
+            import data_processor as _dp
+            result = run_pipeline(
+                use_dummy=use_dummy,
+                _variable_name=_dp.VARIABLE_NAME,
+            )
             st.session_state["pipeline_result"] = result
 
             progress.progress(30, text="Data loaded. Starting interpolation...")

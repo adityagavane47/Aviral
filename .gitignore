@@ -18,7 +18,7 @@ venv/
 # ── Project-specific data & model weights ────────────────
 data/*.nc          # raw INSAT NetCDF files (can be large)
 models/train_log/  # RIFE pretrained weights
-
+models/ECCV2022-RIFE/ # RIFE source repo (nested git)
 # ── Documents to exclude ─────────────────────────────────
 product_requirements_document.md
 
